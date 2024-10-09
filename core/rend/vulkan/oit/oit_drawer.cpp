@@ -28,6 +28,9 @@
 void OITDrawer::DrawPoly(const vk::CommandBuffer& cmdBuffer, u32 listType, bool autosort, Pass pass,
 		const PolyParam& poly, u32 first, u32 count)
 {
+	static const float scopeColor[4] = { 0.25f, 0.50f, 0.25f, 1.0f };
+	CommandBufferDebugScope _(cmdBuffer, "DrawPoly(OIT)", scopeColor);
+
 	vk::Rect2D scissorRect;
 	TileClipping tileClip = SetTileClip(poly.tileclip, scissorRect);
 	if (tileClip == TileClipping::Outside)
@@ -133,6 +136,10 @@ void OITDrawer::DrawList(const vk::CommandBuffer& cmdBuffer, u32 listType, bool 
 {
 	if (first == last)
 		return;
+
+	static const float scopeColor[4] = { 0.50f, 0.25f, 0.50f, 1.0f };
+	CommandBufferDebugScope _(cmdBuffer, "DrawList(OIT)", scopeColor);
+
 	const PolyParam *pp_end = polys.data() + last;
 	for (const PolyParam *pp = &polys[first]; pp != pp_end; pp++)
 		if (pp->count > 2)
@@ -144,6 +151,9 @@ void OITDrawer::DrawModifierVolumes(const vk::CommandBuffer& cmdBuffer, int firs
 {
 	if (count == 0 || pvrrc.modtrig.empty() || !config::ModifierVolumes)
 		return;
+
+	static const float scopeColor[4] = { 0.75f, 0.25f, 0.25f, 1.0f };
+	CommandBufferDebugScope _(cmdBuffer, "DrawModVols(OIT)", scopeColor);
 
 	cmdBuffer.bindVertexBuffers(0, curMainBuffer, offsets.modVolOffset);
 	SetScissor(cmdBuffer, baseScissor);
@@ -278,6 +288,9 @@ bool OITDrawer::Draw(const Texture *fogTexture, const Texture *paletteTexture)
 {
 	vk::CommandBuffer cmdBuffer = NewFrame();
 
+	static const float scopeColor[4] = { 0.75f, 0.75f, 0.75f, 1.0f };
+	CommandBufferDebugScope _(cmdBuffer, "Draw(OIT)", scopeColor);
+
 	if (needAttachmentTransition)
 	{
 		needAttachmentTransition = false;
@@ -401,11 +414,21 @@ bool OITDrawer::Draw(const Texture *fogTexture, const Texture *paletteTexture)
 		DrawList(cmdBuffer, ListType_Punch_Through, false, Pass::Color, pvrrc.global_param_pt, previous_pass.pt_count, current_pass.pt_count);
 
 		// TR
-		if (current_pass.autosort)
+		if (firstFrameAfterInit)
 		{
-			if (!firstFrameAfterInit)
-				DrawList(cmdBuffer, ListType_Translucent, true, Pass::OIT, pvrrc.global_param_tr, previous_pass.tr_count, current_pass.tr_count);
+			// Clear abuffers
+			cmdBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipelineManager->GetClearPipeline());
+			quadBuffer->Bind(cmdBuffer);
+			quadBuffer->Draw(cmdBuffer);
+
+			vk::MemoryBarrier memoryBarrier(vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead);
+			cmdBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader, vk::PipelineStageFlagBits::eFragmentShader,
+					vk::DependencyFlagBits::eByRegion, memoryBarrier, nullptr, nullptr);
+			cmdBuffer.bindVertexBuffers(0, curMainBuffer, {0});
+			firstFrameAfterInit = false;
 		}
+		if (current_pass.autosort)
+			DrawList(cmdBuffer, ListType_Translucent, true, Pass::OIT, pvrrc.global_param_tr, previous_pass.tr_count, current_pass.tr_count);
 		else
 			DrawList(cmdBuffer, ListType_Translucent, false, Pass::Color, pvrrc.global_param_tr, previous_pass.tr_count, current_pass.tr_count);
 
@@ -421,21 +444,7 @@ bool OITDrawer::Draw(const Texture *fogTexture, const Texture *paletteTexture)
 			cmdBuffer.clearAttachments(vk::ClearAttachment(vk::ImageAspectFlagBits::eColor, 0, clear_colors[0]),
 					vk::ClearRect(viewport, 0, 1));
 		}
-		SetScissor(cmdBuffer, baseScissor);
 
-		if (firstFrameAfterInit)
-		{
-			// missing the transparent stuff on the first frame cuz I'm lazy
-			// Clear
-			cmdBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipelineManager->GetClearPipeline());
-			quadBuffer->Bind(cmdBuffer);
-			quadBuffer->Draw(cmdBuffer);
-
-			vk::MemoryBarrier memoryBarrier(vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead);
-			cmdBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader, vk::PipelineStageFlagBits::eFragmentShader,
-					vk::DependencyFlagBits::eByRegion, memoryBarrier, nullptr, nullptr);
-			firstFrameAfterInit = false;
-		}
 		// Tr modifier volumes
 		if (GetContext()->GetVendorID() != VulkanContext::VENDOR_QUALCOMM)	// Adreno bug
 		{
@@ -445,6 +454,7 @@ bool OITDrawer::Draw(const Texture *fogTexture, const Texture *paletteTexture)
 				DrawModifierVolumes<true>(cmdBuffer, previous_pass.mvo_tr_count, current_pass.mvo_tr_count - previous_pass.mvo_tr_count, pvrrc.global_param_mvo_tr.data());
 		}
 
+		SetScissor(cmdBuffer, viewport);
 		vk::Pipeline pipeline = pipelineManager->GetFinalPipeline(dithering && finalPass);
 		cmdBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
 		quadBuffer->Bind(cmdBuffer);
@@ -582,13 +592,15 @@ vk::CommandBuffer OITTextureDrawer::NewFrame()
 		}
 		textureCache->SetInFlight(texture);
 
+		constexpr vk::ImageUsageFlags imageUsage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled;
 		if (!texture->image || texture->format != vk::Format::eR8G8B8A8Unorm
-				|| texture->extent.width != widthPow2 || texture->extent.height != heightPow2)
+				|| texture->extent.width != widthPow2 || texture->extent.height != heightPow2
+				|| (texture->usageFlags & imageUsage) != imageUsage)
 		{
 			texture->extent = vk::Extent2D(widthPow2, heightPow2);
 			texture->format = vk::Format::eR8G8B8A8Unorm;
 			texture->needsStaging = true;
-			texture->CreateImage(vk::ImageTiling::eOptimal, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+			texture->CreateImage(vk::ImageTiling::eOptimal, imageUsage,
 					vk::ImageLayout::eUndefined, vk::ImageAspectFlagBits::eColor);
 			colorImageCurrentLayout = vk::ImageLayout::eUndefined;
 		}

@@ -59,8 +59,13 @@ public:
 				context->PresentLastFrame();
 			}
 			if (!justStarted)
+			{
+				const vk::CommandBuffer targetCommandBuffer = getCommandBuffer();
+				static const float scopeColor[4] = {0.26f, 0.59f, 0.98f, 0.31f};
+				CommandBufferDebugScope _(targetCommandBuffer, "ImGui", scopeColor);
 				// Record Imgui Draw Data and draw funcs into command buffer
 				ImGui_ImplVulkan_RenderDrawData(drawData, (VkCommandBuffer)getCommandBuffer());
+			}
 			justStarted = false;
 			if (!rendering || newFrameStarted)
 				context->EndFrame();
@@ -99,8 +104,8 @@ public:
 								vk::SamplerMipmapMode::eNearest,
 								vk::SamplerAddressMode::eClampToBorder,
 								vk::SamplerAddressMode::eClampToBorder,
-								vk::SamplerAddressMode::eClampToEdge, 0.0f, false,
-								0.f, false, vk::CompareOp::eNever, 0.0f, VK_LOD_CLAMP_NONE,
+								vk::SamplerAddressMode::eClampToBorder, 0.0f, false,
+								0.f, false, vk::CompareOp::eNever, 0.0f, vk::LodClampNone,
 								vk::BorderColor::eFloatTransparentBlack));
 			}
 			sampler = (VkSampler)*pointSampler;
@@ -115,8 +120,8 @@ public:
 								vk::SamplerMipmapMode::eLinear,
 								vk::SamplerAddressMode::eClampToBorder,
 								vk::SamplerAddressMode::eClampToBorder,
-								vk::SamplerAddressMode::eClampToEdge, 0.0f, false,
-								0.f, false, vk::CompareOp::eNever, 0.0f, VK_LOD_CLAMP_NONE,
+								vk::SamplerAddressMode::eClampToBorder, 0.0f, false,
+								0.f, false, vk::CompareOp::eNever, 0.0f, vk::LodClampNone,
 								vk::BorderColor::eFloatTransparentBlack));
 			}
 			sampler = (VkSampler)*linearSampler;

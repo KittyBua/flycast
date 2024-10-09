@@ -207,25 +207,50 @@ bool VulkanContext::InitInstance(const char** extensions, uint32_t extensions_co
 #endif
 #endif
 
-		const auto devices = instance->enumeratePhysicalDevices();
+		auto devices = instance->enumeratePhysicalDevices();
 		if (devices.empty())
 		{
 			ERROR_LOG(RENDERER, "Vulkan error: no physical devices found");
 			return false;
 		}
 
-		// Choose a discrete gpu if there's one, otherwise just pick the first one
-		physicalDevice = nullptr;
-		for (const auto& phyDev : devices)
-		{
-			if (phyDev.getProperties().deviceType == vk::PhysicalDeviceType::eDiscreteGpu)
+		// The order of physical-devices provided by the driver should be somewhat preserved with stable-partitions/stable-sorts
+
+		// Prefer GPUs that support optimal R5G5B5/R5G6B5A1/R4G4B4A4
+		const auto supportsOptimalFormat = [](vk::Format format)
 			{
-				physicalDevice = phyDev;
-				break;
+				return [format](const vk::PhysicalDevice& physicalDevice) -> bool
+					{
+						const vk::FormatProperties formatProperties = physicalDevice.getFormatProperties(format);
+						return (formatProperties.optimalTilingFeatures & vk::FormatFeatureFlagBits::eSampledImage)
+							&& (formatProperties.optimalTilingFeatures & vk::FormatFeatureFlagBits::eBlitDst)
+							&& (formatProperties.optimalTilingFeatures & vk::FormatFeatureFlagBits::eBlitSrc);
+					};
+			};
+		std::stable_partition(devices.begin(), devices.end(), supportsOptimalFormat(vk::Format::eR5G6B5UnormPack16));
+		std::stable_partition(devices.begin(), devices.end(), supportsOptimalFormat(vk::Format::eR5G5B5A1UnormPack16));
+		std::stable_partition(devices.begin(), devices.end(), supportsOptimalFormat(vk::Format::eR4G4B4A4UnormPack16));
+
+		// Prefer GPUs that support fragmentStoresAndAtomics
+		std::stable_partition(
+			devices.begin(), devices.end(),
+			[](const vk::PhysicalDevice& physicalDevice) -> bool
+			{
+				return !!physicalDevice.getFeatures().fragmentStoresAndAtomics;
 			}
-		}
-		if (!physicalDevice)
-			physicalDevice = devices.front();
+		);
+
+		// Finally, prefer Discrete GPUs
+		std::stable_partition(
+			devices.begin(), devices.end(),
+			[](const vk::PhysicalDevice& physicalDevice) -> bool
+			{
+				return physicalDevice.getProperties().deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+			}
+		);
+
+		// Top of the device-list is the _most_ qualified GPU
+		physicalDevice = devices.front();
 
 		vk::PhysicalDeviceProperties properties = physicalDevice.getProperties();
 		if (vulkan11 && properties.apiVersion >= VK_API_VERSION_1_1)
@@ -382,49 +407,47 @@ bool VulkanContext::InitDevice()
 		else
 			DEBUG_LOG(RENDERER, "Using distinct Graphics and Present queue families");
 
-		// Enable VK_KHR_dedicated_allocation if available
-		bool getMemReq2Supported = false;
-		dedicatedAllocationSupported = false;
-		std::vector<const char *> deviceExtensions = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
-		for (const auto& property : physicalDevice.enumerateDeviceExtensionProperties())
+
+		std::set<std::string> supportedExtensions;
+
+		const auto deviceExtensionProperties = physicalDevice.enumerateDeviceExtensionProperties();
+		for (const auto& property : deviceExtensionProperties)
 		{
-			if (!strcmp(property.extensionName, VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME))
+			supportedExtensions.insert(property.extensionName);
+		}
+
+		std::vector<const char*> enabledExtensions;
+
+		const auto tryAddDeviceExtension = [&supportedExtensions = std::as_const(supportedExtensions), &enabledExtensions]
+		(std::string_view extensionName) -> bool
+		{
+			if (supportedExtensions.count(extensionName.data()))
 			{
-				deviceExtensions.push_back(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
-				getMemReq2Supported = true;
+				enabledExtensions.push_back(extensionName.data());
+				NOTICE_LOG(RENDERER, "Device extension enabled: %s", extensionName.data());
+				return true;
 			}
-			else if (!strcmp(property.extensionName, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME))
-			{
-				deviceExtensions.push_back(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
-				dedicatedAllocationSupported = true;
-			}
+			NOTICE_LOG(RENDERER, "Device extension unavailable: %s", extensionName.data());
+			return false;
+		};
+
+		// Required swapchain extension
+		tryAddDeviceExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+
+		// Enable VK_KHR_dedicated_allocation if available
+		const bool getMemReq2Supported = tryAddDeviceExtension(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
+		dedicatedAllocationSupported = tryAddDeviceExtension(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+		dedicatedAllocationSupported &= getMemReq2Supported;
+
 #ifdef VK_ENABLE_BETA_EXTENSIONS
-			else if (!strcmp(property.extensionName, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME))
-				deviceExtensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+		tryAddDeviceExtension(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
 #endif
 #ifdef VK_USE_PLATFORM_METAL_EXT
-			else if (!strcmp(property.extensionName, VK_EXT_METAL_OBJECTS_EXTENSION_NAME))
-				deviceExtensions.push_back(VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
+		tryAddDeviceExtension(VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
 #endif
 #ifdef VK_DEBUG
-			else if (!strcmp(property.extensionName, VK_EXT_DEBUG_MARKER_EXTENSION_NAME))
-			{
-				NOTICE_LOG(RENDERER, "Debug extension %s available", property.extensionName.data());
-				deviceExtensions.push_back(VK_EXT_DEBUG_MARKER_EXTENSION_NAME);
-			}
-			else if(!strcmp(property.extensionName, VK_EXT_DEBUG_REPORT_EXTENSION_NAME))
-			{
-				NOTICE_LOG(RENDERER, "Debug extension %s available", property.extensionName.data());
-				deviceExtensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
-			}
-			else if (!strcmp(property.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
-			{
-				NOTICE_LOG(RENDERER, "Debug extension %s available", property.extensionName.data());
-				deviceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-			}
+		tryAddDeviceExtension(VK_EXT_DEBUG_MARKER_EXTENSION_NAME);
 #endif
-		}
-		dedicatedAllocationSupported &= getMemReq2Supported;
 
 		// create a UniqueDevice
 		float queuePriority = 1.0f;
@@ -435,7 +458,7 @@ bool VulkanContext::InitDevice()
 		if (samplerAnisotropy)
 			features.samplerAnisotropy = true;
 		device = physicalDevice.createDeviceUnique(vk::DeviceCreateInfo(vk::DeviceCreateFlags(), deviceQueueCreateInfo,
-				nullptr, deviceExtensions, &features));
+				nullptr, enabledExtensions, &features));
 
 #if VULKAN_HPP_DISPATCH_LOADER_DYNAMIC == 1
 		VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
@@ -899,7 +922,7 @@ void VulkanContext::Present() noexcept
 
 void VulkanContext::DrawFrame(vk::ImageView imageView, const vk::Extent2D& extent, float aspectRatio)
 {
-	QuadVertex vtx[] {
+	QuadVertex vtx[4] {
 		{ -1, -1, 0, 0, 0 },
 		{  1, -1, 0, 1, 0 },
 		{ -1,  1, 0, 0, 1 },
@@ -913,6 +936,10 @@ void VulkanContext::DrawFrame(vk::ImageView imageView, const vk::Extent2D& exten
 	vtx[2].y = vtx[3].y = vtx[0].y + 2;
 
 	vk::CommandBuffer commandBuffer = GetCurrentCommandBuffer();
+
+	static const float scopeColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+	CommandBufferDebugScope _(commandBuffer, "DrawFrame", scopeColor);
+
 	if (config::Rotate90)
 		quadRotatePipeline->BindPipeline(commandBuffer);
 	else
@@ -1266,6 +1293,10 @@ bool VulkanContext::GetLastFrame(std::vector<u8>& data, int& width, int& height)
 	vk::UniqueCommandBuffer commandBuffer = std::move(device->allocateCommandBuffersUnique(
 			vk::CommandBufferAllocateInfo(*commandPools.back(), vk::CommandBufferLevel::ePrimary, 1)).front());
 	commandBuffer->begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+
+	static const float scopeColor[4] = { 1.0f, 1.0f, 0.0f, 1.0f };
+	CommandBufferDebugScope _(commandBuffer.get(), "GetLastFrame", scopeColor);
+
 	// render pass
 	vk::AttachmentDescription attachmentDescription = vk::AttachmentDescription(vk::AttachmentDescriptionFlags(), vk::Format::eR8G8B8A8Unorm, vk::SampleCountFlagBits::e1,
 			vk::AttachmentLoadOp::eClear, vk::AttachmentStoreOp::eStore, vk::AttachmentLoadOp::eDontCare, vk::AttachmentStoreOp::eDontCare,
@@ -1289,7 +1320,7 @@ bool VulkanContext::GetLastFrame(std::vector<u8>& data, int& width, int& height)
 	pipeline.BindPipeline(*commandBuffer);
 
 	// Draw
-	QuadVertex vtx[] {
+	QuadVertex vtx[4] {
 		{ -1, -1, 0, 0, 0 },
 		{  1, -1, 0, 1, 0 },
 		{ -1,  1, 0, 0, 1 },
